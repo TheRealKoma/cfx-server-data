@@ -1,106 +1,83 @@
---- player-data is a basic resource to showcase player identifier storage
---
--- it works in a fairly simple way: a set of identifiers is assigned to an account ID, and said
--- account ID is then returned/added as state bag
---
--- it also implements the `cfx.re/playerData.v1alpha1` spec, which is exposed through the following:
--- - getPlayerId(source: string)
--- - getPlayerById(dbId: string)
--- - getPlayerIdFromIdentifier(identifier: string)
--- - setting `cfx.re/playerData@id` state bag field on the player
-
--- identifiers that we'll ignore (e.g. IP) as they're low-trust/high-variance
+--- identifiers, die wir ignorieren (z.B. IP), da sie ein geringes Vertrauen und hohe Varianz haben
 local identifierBlocklist = {
     ip = true
 }
 
--- function to check if the identifier is blocked
+--- Überprüft, ob der Identifier blockiert ist.
+---@param identifier string Der zu überprüfende Identifier.
+---@return boolean Gibt true zurück, wenn der Identifier blockiert ist, andernfalls false.
 local function isIdentifierBlocked(identifier)
-    -- Lua pattern to correctly split
-    local idType = identifier:match('([^:]+):')
-
-    -- ensure it's a boolean
+    local idType, _ = string.find(identifier, ":")
     return identifierBlocklist[idType] or false
 end
 
--- our database schema, in hierarchical KVS syntax:
--- player:
---     <id>:
---         identifier:
---             <identifier>: 'true'
--- identifier:
---     <identifier>: <playerId>
-
--- list of player indices to data
+-- Spielerdaten in Lua-Tabellen speichern
 local players = {}
-
--- list of player DBIDs to player indices
 local playersById = {}
 
--- a sequence field using KVS
+--- Inkrementiert die ID-Sequenz und gibt die nächste verfügbare ID zurück.
+---@return number Die nächste verfügbare ID.
 local function incrementId()
-    local nextId = GetResourceKvpInt('nextId')
-    nextId = nextId + 1
+    local nextId = GetResourceKvpInt('nextId') + 1
     SetResourceKvpInt('nextId', nextId)
-
     return nextId
 end
 
--- gets the ID tied to an identifier in the schema, or nil
+--- Ruft die Spieler-ID anhand des Identifiers ab.
+---@param identifier string Der Identifier, für den die Spieler-ID abgerufen werden soll.
+---@return number|nil Die Spieler-ID oder nil, wenn keine Spieler-ID für den angegebenen Identifier gefunden wurde.
 local function getPlayerIdFromIdentifier(identifier)
     local str = GetResourceKvpString(('identifier:%s'):format(identifier))
-
     if not str then
         return nil
     end
-
     return msgpack.unpack(str).id
 end
 
--- stores the identifier + adds to a logging list
+--- Speichert die Spieler-ID für den angegebenen Identifier.
+---@param identifier string Der zu speichernde Identifier.
+---@param id number Die zugehörige Spieler-ID.
 local function setPlayerIdFromIdentifier(identifier, id)
     local str = ('identifier:%s'):format(identifier)
     SetResourceKvp(str, msgpack.pack({ id = id }))
     SetResourceKvp(('player:%s:identifier:%s'):format(id, identifier), 'true')
 end
 
--- stores any new identifiers for this player ID
+--- Speichert neue Identifier für diese Spieler-ID.
+---@param playerIdx number Der Spielerindex.
+---@param newId number Die zugehörige Spieler-ID.
 local function storeIdentifiers(playerIdx, newId)
-    for _, identifier in ipairs(GetPlayerIdentifiers(playerIdx)) do
+    for _, identifier in pairs(GetPlayerIdentifiers(playerIdx)) do
         if not isIdentifierBlocked(identifier) then
-            -- TODO: check if the player already has an identifier of this type
             setPlayerIdFromIdentifier(identifier, newId)
         end
     end
 end
 
--- registers a new player (increments sequence, stores data, returns ID)
+--- Registriert einen neuen Spieler und gibt die zugewiesene Spieler-ID zurück.
+---@param playerIdx number Der Spielerindex.
+---@return number Die zugewiesene Spieler-ID.
 local function registerPlayer(playerIdx)
     local newId = incrementId()
     storeIdentifiers(playerIdx, newId)
-
     return newId
 end
 
--- initializes a player's data set
+--- Initialisiert die Spielerdaten für den angegebenen Spielerindex.
+---@param playerIdx number Der Spielerindex.
 local function setupPlayer(playerIdx)
-    -- try getting the oldest-known identity from all the player's identifiers
     local defaultId = 0xFFFFFFFFFF
     local lowestId = defaultId
 
-    for _, identifier in ipairs(GetPlayerIdentifiers(playerIdx)) do
+    for _, identifier in pairs(GetPlayerIdentifiers(playerIdx)) do
         if not isIdentifierBlocked(identifier) then
             local dbId = getPlayerIdFromIdentifier(identifier)
-
-            if dbId then
-                if dbId < lowestId then
-                    lowestId = dbId
-                end
+            if dbId and dbId < lowestId then
+                lowestId = dbId
             end
         end
     end
 
-    -- if this is the default ID, register. if not, update
     local playerId
 
     if lowestId == defaultId then
@@ -110,32 +87,24 @@ local function setupPlayer(playerIdx)
         playerId = lowestId
     end
 
-    -- add state bag field
     if Player then
         Player(playerIdx).state['cfx.re/playerData@id'] = playerId
     end
 
-    -- and add to our caching tables
     players[playerIdx] = {
         dbId = playerId
     }
-
     playersById[tostring(playerId)] = playerIdx
 end
 
--- we want to add a player pretty early
 AddEventHandler('playerConnecting', function()
     local playerIdx = tostring(source)
     setupPlayer(playerIdx)
 end)
 
--- and migrate them to a 'joining' ID where possible
 RegisterNetEvent('playerJoining')
-
 AddEventHandler('playerJoining', function(oldIdx)
-    -- resource restart race condition
     local oldPlayer = players[tostring(oldIdx)]
-
     if oldPlayer then
         players[tostring(source)] = oldPlayer
         players[tostring(oldIdx)] = nil
@@ -144,29 +113,23 @@ AddEventHandler('playerJoining', function(oldIdx)
     end
 end)
 
--- remove them if they're dropped
 AddEventHandler('playerDropped', function()
     local player = players[tostring(source)]
-
     if player then
         playersById[tostring(player.dbId)] = nil
     end
-
     players[tostring(source)] = nil
 end)
 
--- and when the resource is restarted, set up all players that are on right now
-for _, player in ipairs(GetPlayers()) do
+for _, player in pairs(GetPlayers()) do
     setupPlayer(player)
 end
 
--- also a quick command to get the current state
 RegisterCommand('playerData', function(source, args)
     if not args[1] then
-        print('Usage:')
-        print('\tplayerData getId <dbId>: gets identifiers for ID')
-        print('\tplayerData getIdentifier <identifier>: gets ID for identifier')
-
+        print('Verwendung:')
+        print('\tplayerData getId <dbId>: gibt Identifier für ID zurück')
+        print('\tplayerData getIdentifier <identifier>: gibt ID für Identifier zurück')
         return
     end
 
@@ -179,19 +142,18 @@ RegisterCommand('playerData', function(source, args)
             key = FindKvp(handle)
 
             if key then
-                print('result:', key:sub(#prefix + 1))
+                print('Ergebnis:', key:sub(#prefix + 1))
             end
         until not key
 
         EndFindKvp(handle)
     elseif args[1] == 'getIdentifier' then
-        print('result:', getPlayerIdFromIdentifier(args[2]))
+        print('Ergebnis:', getPlayerIdFromIdentifier(args[2]))
     end
 end, true)
 
--- COMPATIBILITY for server versions that don't export provide
 local function getExportEventName(resource, name)
-	return string.format('__cfx_export_%s_%s', resource, name)
+    return string.format('__cfx_export_%s_%s', resource, name)
 end
 
 function AddExport(name, fn)
@@ -204,16 +166,13 @@ function AddExport(name, fn)
     exports(name, fn)
 end
 
--- exports
 AddExport('getPlayerIdFromIdentifier', getPlayerIdFromIdentifier)
 
 AddExport('getPlayerId', function(playerIdx)
     local player = players[tostring(playerIdx)]
-
     if not player then
         return nil
     end
-
     return player.dbId
 end)
 
